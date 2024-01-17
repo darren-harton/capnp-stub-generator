@@ -935,12 +935,13 @@ class Writer:
         out = []
         out.append(self.docstring)
         out.append("import os")
+        out.append("import site")
         out.append("import capnp # type: ignore")
         out.append("capnp.remove_import_hook()")
         out.append("here = os.path.dirname(os.path.abspath(__file__))")
 
         out.append(f'module_file = os.path.abspath(os.path.join(here, "{self.display_name}"))')
-        out.append("module = capnp.load(module_file)  # pylint: disable=no-member")
+        out.append("module = capnp.load(module_file, imports=site.getsitepackages())  # pylint: disable=no-member")
 
         for scope in self.scopes_by_id.values():
             if scope.parent is not None and scope.parent.is_root:
