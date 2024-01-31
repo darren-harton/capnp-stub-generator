@@ -7,6 +7,7 @@ import logging
 import os.path
 from types import ModuleType
 import re
+import site
 
 import black
 import capnp  # type: ignore
@@ -102,7 +103,7 @@ def run(args: argparse.Namespace, root_directory: str):
     module_registry: ModuleRegistryType = {}
 
     for path in valid_paths:
-        module = parser.load(path)
+        module = parser.load(path, imports=site.getsitepackages())
         module_registry[module.schema.node.id] = (path, module)
 
     for path, module in module_registry.values():
