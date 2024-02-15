@@ -650,11 +650,10 @@ class Writer:
                     slot_field.typed_variable_with_full_hints
                 )  # .get_typed_variable_with_affixes([helper.BUILDER_NAME, helper.READER_NAME]))
 
-        self.scope.add(helper.new_decorator("staticmethod"))
         self.scope.add(
             helper.new_function(
                 "from_dict",
-                parameters=[helper.TypeHintedVariable("dictionary", [helper.TypeHint("dict", primary=True)])],
+                parameters=["self", helper.TypeHintedVariable("dictionary", [helper.TypeHint("dict", primary=True)])],
                 return_type=None,
             )
         )
