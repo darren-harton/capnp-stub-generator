@@ -655,7 +655,7 @@ class Writer:
             helper.new_function(
                 "from_dict",
                 parameters=[helper.TypeHintedVariable("dictionary", [helper.TypeHint("dict", primary=True)])],
-                return_type=scoped_new_builder_type_name,
+                return_type=None,
             )
         )
 
