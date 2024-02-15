@@ -40,6 +40,7 @@ class CapnpElementType:
     VOID = "void"
     LIST = "list"
     ANY_POINTER = "anyPointer"
+    INTERFACE = "interface"
 
 
 ModuleRegistryType = Dict[int, Tuple[str, ModuleType]]

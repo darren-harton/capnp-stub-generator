@@ -6,6 +6,8 @@ Note: capnp interfaces (RPC) are not yet supported.
 """
 from __future__ import annotations
 
+import dataclasses
+import inspect
 import logging
 import os.path
 import pathlib
@@ -15,6 +17,7 @@ from typing import Literal
 from typing import Tuple
 
 import capnp  # type: ignore
+import capnp.lib.capnp as libcapnp
 from capnp_stub_generator import capnp_types
 from capnp_stub_generator import helper
 from capnp_stub_generator.scope import CapnpType
@@ -31,7 +34,7 @@ InitChoice = Tuple[str, str]
 class Writer:
     """A class that handles writing the stub file, based on a provided module definition."""
 
-    VALID_TYPING_IMPORTS = Literal["Iterator", "Generic", "TypeVar", "Sequence", "Literal", "Union", "overload"]
+    VALID_TYPING_IMPORTS = Literal["Any", "Iterator", "Generic", "TypeVar", "Sequence", "Literal", "Union", "overload"]
 
     def __init__(self, module: ModuleType, module_registry: capnp_types.ModuleRegistryType):
         """Initialize the stub writer with a module definition.
@@ -42,6 +45,12 @@ class Writer:
         """
         self.scope = Scope(name="", id=module.schema.node.id, parent=None, return_scope=None)
         self.scopes_by_id: dict[int, Scope] = {self.scope.id: self.scope}
+
+        # Add an anonymous scope for things without parents
+        # self.scopes_by_id[0] = self.scope
+        self.scopes_by_id[0] = Scope(name="_", id=0, parent=self.scope, return_scope=None)
+        self.scopes_by_id[0].parent = None  # Trust me, bro
+
 
         self._module = module
         self._module_registry = module_registry
@@ -123,6 +132,7 @@ class Writer:
         field: Any,
         new_type: CapnpType,
         init_choices: list[InitChoice],
+        skip_extras: bool = False
     ) -> helper.TypeHintedVariable | None:
         """Generates a new type from a slot. Which type, is later determined.
 
@@ -150,11 +160,17 @@ class Writer:
 
         elif field_slot_type == capnp_types.CapnpElementType.STRUCT:
             hinted_variable = self.gen_struct_slot(field, raw_field.schema, init_choices)
-            hinted_variable.add_builder_from_primary_type()
-            hinted_variable.add_reader_from_primary_type()
+            if not skip_extras:
+                hinted_variable.add_builder_from_primary_type()
+                hinted_variable.add_reader_from_primary_type()
 
         elif field_slot_type == capnp_types.CapnpElementType.ANY_POINTER:
             hinted_variable = self.gen_any_pointer_slot(field, new_type)
+
+        elif field_slot_type == capnp_types.CapnpElementType.INTERFACE:
+            hinted_variable = self.gen_interface_slot(field, raw_field.schema, init_choices)
+            # hinted_variable.add_builder_from_primary_type()
+            # hinted_variable.add_reader_from_primary_type()
 
         else:
             raise TypeError(f"Unknown field slot type {field_slot_type}.")
@@ -162,26 +178,26 @@ class Writer:
         return hinted_variable
 
     def gen_list_slot(
-        self, field: capnp.lib.capnp._DynamicStructReader, schema: capnp.lib.capnp._ListSchema
+        self, field: libcapnp._DynamicStructReader, schema: libcapnp._ListSchema
     ) -> helper.TypeHintedVariable:
         """Generate a slot, which contains a `list`.
 
         Args:
-            field (capnp.lib.capnp._DynamicStructReader): The field reader.
-            schema (capnp.lib.capnp._ListSchema): The schema of the list.
+            field (libcapnp._DynamicStructReader): The field reader.
+            schema (libcapnp._ListSchema): The schema of the list.
 
         Returns:
             helper.TypeHintedVariable: The extracted hinted variable object.
         """
 
-        def schema_elements(schema: capnp.lib.capnp._ListSchema) -> capnp.lib.capnp._ListSchema:
+        def schema_elements(schema: libcapnp._ListSchema) -> libcapnp._ListSchema:
             """An iterator over the schema elements of nested lists.
 
             Args:
-                schema (capnp.lib.capnp._ListSchema): The schema of a list.
+                schema (libcapnp._ListSchema): The schema of a list.
 
             Returns:
-                capnp.lib.capnp._ListSchema: The next deeper nested list schema.
+                libcapnp._ListSchema: The next deeper nested list schema.
             """
             next_schema_element = schema
 
@@ -195,14 +211,14 @@ class Writer:
                 else:
                     yield next_schema_element
 
-        def list_elements(list_: capnp.lib.capnp._DynamicStructReader) -> capnp.lib.capnp._DynamicStructReader:
+        def list_elements(list_: libcapnp._DynamicStructReader) -> libcapnp._DynamicStructReader:
             """An iterator over the list elements of nested lists.
 
             Args:
-                list_ (capnp.lib.capnp._DynamicStructReader): A list element.
+                list_ (libcapnp._DynamicStructReader): A list element.
 
             Returns:
-                capnp.lib.capnp._DynamicStructReader: The next deeper nested list element.
+                libcapnp._DynamicStructReader: The next deeper nested list element.
             """
             next_list_element = list_
 
@@ -220,7 +236,9 @@ class Writer:
         nested_schema_elements = list(schema_elements(schema))
         nested_list_elements = list(list_elements(field.slot.type))
 
-        create_extended_types = True
+        element_type = field.slot.type.list.elementType
+        # Only add readers and builders for struct types.
+        create_extended_types = element_type.which() == 'struct'
 
         try:
             last_element = nested_schema_elements[-1]
@@ -261,12 +279,12 @@ class Writer:
         return hinted_variable
 
     def gen_python_type_slot(
-        self, field: capnp.lib.capnp._DynamicStructReader, field_type: str
+        self, field: libcapnp._DynamicStructReader, field_type: str
     ) -> helper.TypeHintedVariable:
         """Generate a slot, which contains a regular Python type.
 
         Args:
-            field (capnp.lib.capnp._DynamicStructReader): The field reader.
+            field (libcapnp._DynamicStructReader): The field reader.
             field_type (str): The (primitive) type of the slot.
 
         Returns:
@@ -275,12 +293,12 @@ class Writer:
         python_type_name: str = capnp_types.CAPNP_TYPE_TO_PYTHON[field_type]
         return helper.TypeHintedVariable(field.name, [helper.TypeHint(python_type_name, primary=True)])
 
-    def gen_enum_slot(self, field: capnp.lib.capnp._DynamicStructReader, schema) -> helper.TypeHintedVariable:
+    def gen_enum_slot(self, field: libcapnp._DynamicStructReader, schema) -> helper.TypeHintedVariable:
         """Generate a slot, which contains a `enum`.
 
         Args:
-            field (capnp.lib.capnp._DynamicStructReader): The field reader.
-            schema (capnp.lib.capnp._StructSchema): The schema of the field.
+            field (libcapnp._DynamicStructReader): The field reader.
+            schema (libcapnp._StructSchema): The schema of the field.
 
         Returns:
             str: The type-hinted slot.
@@ -297,34 +315,36 @@ class Writer:
 
     def gen_struct_slot(
         self,
-        field: capnp.lib.capnp._DynamicStructReader,
-        schema: capnp.lib.capnp._StructSchema,
+        field: libcapnp._DynamicStructReader,
+        schema: libcapnp._StructSchema,
         init_choices: list[InitChoice],
+        anonymous=False,
+        base_classes = None
     ) -> helper.TypeHintedVariable:
         """Generate a slot, which contains a `struct`.
 
         Args:
-            field (capnp.lib.capnp._DynamicStructReader): The field reader.
-            schema (capnp.lib.capnp._StructSchema): The schema of the field.
+            field (libcapnp._DynamicStructReader): The field reader.
+            schema (libcapnp._StructSchema): The schema of the field.
             init_choices (list[InitChoice]): A list of overloaded `init` function choices, to be filled by this function.
 
         Returns:
             helper.HintedVariable: The extracted hinted variable object.
         """
         if not self.is_type_id_known(schema.node.id):
-            self.gen_struct(schema)
+            self.gen_struct(schema, anonymous=anonymous, base_classes=base_classes)
 
         type_name = self.get_type_name(field.slot.type)
         init_choices.append((field.name, type_name))
         return helper.TypeHintedVariable(field.name, [helper.TypeHint(type_name, primary=True)])
 
     def gen_any_pointer_slot(
-        self, field: capnp.lib.capnp._DynamicStructReader, new_type: CapnpType
+        self, field: libcapnp._DynamicStructReader, new_type: CapnpType
     ) -> helper.TypeHintedVariable | None:
         """Generate a slot, which contains an `any_pointer` object.
 
         Args:
-            field (capnp.lib.capnp._DynamicStructReader): The field reader.
+            field (libcapnp._DynamicStructReader): The field reader.
             new_type (CapnpType): The new type that was registered previously.
 
         Returns:
@@ -338,11 +358,34 @@ class Writer:
         except capnp.KjException:
             return None
 
-    def gen_const(self, schema: capnp.lib.capnp._StructSchema) -> None:
+    def gen_interface_slot(
+            self,
+            field: libcapnp._DynamicStructReader,
+            schema: libcapnp._StructSchema,
+            init_choices: list[InitChoice],
+    ) -> helper.TypeHintedVariable:
+        """Generate a slot, which contains an `interface` object.
+
+        Args:
+            field (libcapnp._DynamicStructReader): The field reader.
+            new_type (CapnpType): The new type that was registered previously.
+
+        Returns:
+            helper.HintedVariable: The extracted hinted variable object.
+        """
+        if not self.is_type_id_known(schema.node.id):
+            self.gen_interface(schema)
+
+        type_name = self.get_type_name(field.slot.type)
+        init_choices.append((field.name, type_name))
+        return helper.TypeHintedVariable(field.name, [helper.TypeHint(type_name, primary=True)])
+
+
+    def gen_const(self, schema: libcapnp._StructSchema) -> None:
         """Generate a `const` object.
 
         Args:
-            schema (capnp.lib.capnp._StructSchema): The schema to generate the `const` object out of.
+            schema (libcapnp._StructSchema): The schema to generate the `const` object out of.
         """
         assert schema.node.which() == capnp_types.CapnpElementType.CONST
 
@@ -356,13 +399,13 @@ class Writer:
         elif const_type == "struct":
             pass
 
-    def gen_enum(self, schema: capnp.lib.capnp._StructSchema) -> CapnpType | None:
+    def gen_enum(self, schema: libcapnp._StructSchema) -> CapnpType | None:
         """Generate an `enum` object.
 
         An enum object is translated into a list of literals.
 
         Args:
-            schema (capnp.lib.capnp._StructSchema): The schema to generate the `enum` object out of.
+            schema (libcapnp._StructSchema): The schema to generate the `enum` object out of.
         """
         assert schema.node.which() == capnp_types.CapnpElementType.ENUM
 
@@ -381,11 +424,11 @@ class Writer:
 
         return None
 
-    def gen_generic(self, schema: capnp.lib.capnp._StructSchema) -> list[str]:
+    def gen_generic(self, schema: libcapnp._StructSchema) -> list[str]:
         """Generate a `generic` type variable.
 
         Args:
-            schema (capnp.lib.capnp._StructSchema): The schema to generate the `generic` object out of.
+            schema (libcapnp._StructSchema): The schema to generate the `generic` object out of.
 
         Returns:
             list[str]: The list of registered generic type variables.
@@ -400,7 +443,11 @@ class Writer:
             if field.slot.type.which() == "anyPointer" and field.slot.type.anyPointer.which() == "parameter":
                 param = field.slot.type.anyPointer.parameter
 
-                t = self.get_type_by_id(param.scopeId)
+                try:
+                    t = self.get_type_by_id(param.scopeId)
+                except KeyError:
+                    t = None
+
 
                 if t is not None:
                     param_source = t.schema
@@ -410,17 +457,26 @@ class Writer:
         return [self.register_type_var(param) for param in generic_params + referenced_params]
 
     # FIXME: refactor for reducing complexity
-    def gen_struct(self, schema: capnp.lib.capnp._StructSchema, type_name: str = "") -> CapnpType:  # noqa: C901
+    def gen_struct(
+            self,
+            schema: libcapnp._StructSchema,
+            type_name: str = "",
+            anonymous=False,
+            base_classes=None
+    ) -> CapnpType:  # noqa: C901
         """Generate a `struct` object.
 
         Args:
-            schema (capnp.lib.capnp._StructSchema): The schema to generate the `struct` object out of.
+            schema (libcapnp._StructSchema): The schema to generate the `struct` object out of.
             type_name (str, optional): A type name to override the display name of the struct. Defaults to "".
 
         Returns:
             Type: The `struct`-type module that was generated.
         """
-        assert schema.node.which() == capnp_types.CapnpElementType.STRUCT
+        if base_classes is None:
+            base_classes = []
+
+        assert schema.node.which() == capnp_types.CapnpElementType.STRUCT, f"Not a struct {schema.node}"
 
         imported = self.register_import(schema)
 
@@ -432,12 +488,13 @@ class Writer:
 
         registered_params: list[str] = []
         if schema.node.isGeneric:
-            registered_params = self.gen_generic(schema)
+            registered_params.append(helper.new_type_group("Generic", self.gen_generic(schema)))
+
+        registered_params += base_classes
 
         class_declaration: str
         if registered_params:
-            parameter = helper.new_type_group("Generic", registered_params)
-            class_declaration = helper.new_class_declaration(type_name, parameters=[parameter])
+            class_declaration = helper.new_class_declaration(type_name, parameters=registered_params)
 
         else:
             class_declaration = helper.new_class_declaration(type_name)
@@ -638,11 +695,141 @@ class Writer:
 
         return new_type
 
-    def generate_nested(self, schema: capnp.lib.capnp._StructSchema) -> None:
+    def gen_interface(self, schema: libcapnp._InterfaceSchema, type_name: str = "") -> CapnpType:  # noqa: C901
+        """Generate a `struct` object.
+
+        Args:
+            schema (libcapnp._InterfaceSchema): The schema to generate the `interface` object out of.
+            type_name (str, optional): A type name to override the display name of the struct. Defaults to "".
+
+        Returns:
+            Type: The `struct`-type module that was generated.
+        """
+        assert schema.node.which() == capnp_types.CapnpElementType.INTERFACE
+
+        if hasattr(schema, 'as_interface'):
+            schema = schema.as_interface()
+
+        imported = self.register_import(schema)
+
+        if imported is not None:
+            return imported
+
+        if not type_name:
+            type_name = helper.get_display_name(schema)
+
+        registered_params: list[str] = []
+        if schema.node.isGeneric:
+            registered_params = self.gen_generic(schema)
+
+        class_declaration: str
+        if registered_params:
+            parameter = helper.new_type_group("Generic", registered_params)
+            class_declaration = helper.new_class_declaration(type_name, parameters=[parameter])
+
+        else:
+            class_declaration = helper.new_class_declaration(type_name)
+
+        # Do not write the class declaration to the scope, until all nested schemas were expanded.
+        parent_scope = self.new_scope(type_name, schema.node, type="interface")
+
+        new_type: CapnpType = self.register_type(schema.node.id, schema, name=type_name)
+        new_type.generic_params = registered_params
+
+        @dataclasses.dataclass
+        class Function:
+            name: str
+            param_hints: list[helper.TypeHintedVariable] = dataclasses.field(default_factory=list)
+            result_hints: list[helper.TypeHintedVariable] = dataclasses.field(default_factory=list)
+            result_type = None
+
+            def get_result_struct_name(self):
+                name = self.name
+                return f"{name[:1].capitalize() + name[1:]}Result"
+
+            def to_string(self):
+                func_str = helper.new_function(
+                    self.name,
+                    parameters=['self'] + [x.typed_variable_with_full_hints for x in self.param_hints],
+                    return_type=f"{self.get_result_struct_name()}" if self.result_hints else None)
+                return func_str
+
+
+
+        funcs: list[Function] = []
+
+
+        def get_param_hints(param_struct):
+            hints = []
+            for field, raw_field in zip(param_struct.node.struct.fields, param_struct.fields_list):
+                field_type = field.which()
+
+                if field_type == capnp_types.CapnpFieldType.SLOT:
+                    field_slot_type = field.slot.type.which()
+                    if field_slot_type == capnp_types.CapnpElementType.STRUCT:
+                        slot_field = self.gen_struct_slot(field, raw_field.schema, [])
+
+                    else:
+                        slot_field = self.gen_slot(raw_field, field, new_type, [], skip_extras=True)
+
+
+
+                    # if not slot_field:
+                    #     continue
+
+                    # print(slot_field.type_hints)
+                    hints.append(slot_field)
+                else:
+                    raise ValueError("Why would it not be slot?", field_type)
+            return hints
+
+
+
+        for method_name, method in schema.methods_inherited.items():
+            method: libcapnp._InterfaceMethod
+
+            func = Function(name=method_name)
+
+            func.param_hints = get_param_hints(method.param_type)
+            func.result_hints = get_param_hints(method.result_type)
+
+            if len(func.result_hints) > 0:
+                # Generate a new type for the return value since python doesn't have anonymous structs.
+                self.gen_struct(method.result_type, type_name=func.get_result_struct_name())
+
+            funcs.append(func)
+
+
+        # Finally, add the class declaration after the expansion of all nested schemas.
+        parent_scope.add(class_declaration)
+
+        self._add_import("import capnp.lib.capnp as libcapnp")
+
+
+        # Generate the function lines
+        for func in funcs:
+            self.scope.add(func.to_string())
+
+
+        # self.scope.add(f"Server = )
+        self.scope.add(helper.new_class_declaration("Server"))
+        for func in funcs:
+            self._add_typing_import("Any")
+            func.param_hints.append(helper.TypeHintedVariable(name="_context", type_hints=[helper.TypeHint("Any")]))
+            self.scope.add("    async " + func.to_string())
+
+
+        self.return_from_scope()
+
+        return new_type
+
+
+
+    def generate_nested(self, schema: libcapnp._StructSchema) -> None:
         """Generate the type for a nested schema.
 
         Args:
-            schema (capnp.lib.capnp._StructSchema): The schema to generate types for.
+            schema (libcapnp._StructSchema): The schema to generate types for.
 
         Raises:
             AssertionError: If the schema belongs to an unknown type.
@@ -662,7 +849,7 @@ class Writer:
             self.gen_enum(schema)
 
         elif node_type == "interface":
-            logger.warning("Skipping interface: not implemented.")
+            self.gen_interface(schema)
 
         elif node_type == "annotation":
             logger.warning("Skipping annotation: not implemented.")
@@ -675,13 +862,13 @@ class Writer:
         for node in self._module.schema.node.nestedNodes:
             self.generate_nested(self._module.schema.get_nested(node.name))
 
-    def register_import(self, schema: capnp.lib.capnp._StructSchema) -> CapnpType | None:
+    def register_import(self, schema: libcapnp._StructSchema) -> CapnpType | None:
         """Determine, whether a schema is imported from the base module.
 
         If so, the type definition that the schema contains, is added to the type registry.
 
         Args:
-            schema (capnp.lib.capnp._StructSchema): The schema to check.
+            schema (libcapnp._StructSchema): The schema to check.
 
         Returns:
             Type | None: The type of the import, if the schema is imported,
@@ -703,29 +890,39 @@ class Writer:
                     matching_path = pathlib.Path(path)
                     break
 
-        if matching_path is None and isinstance(schema, capnp.lib.capnp._EnumSchema):
+        if matching_path is None and isinstance(schema, libcapnp._EnumSchema):
             logging.error(f"Could not find the path of the enum {definition_name}.")
             return None
 
-        # Since this is an import, there must be a parent module.
-        assert matching_path is not None, f"The module named {module_name} was not provided to the stub generator."
 
-        # Find the relative path to go from the parent module, to this imported module.
-        common_path = os.path.commonpath([self._module_path, matching_path])
+        # Check to see if this is a standard capnp file.
+        if module_name.startswith('capnp'):
+            fname = pathlib.Path(module_name).name
+            search_dir = pathlib.Path(inspect.getfile(capnp)).parent
+            matching_path = search_dir / fname
+            assert matching_path.exists(), f"Could not find path {matching_path}"
 
-        relative_module_path = self._module_path.relative_to(common_path)
-        relative_import_path = matching_path.relative_to(common_path)
+        else:
 
-        # Shape the relative path to a relative Python import statement.
-        python_import_path = "." * len(relative_module_path.parents) + helper.replace_capnp_suffix(
-            ".".join(relative_import_path.parts)
-        )
+            # Since this is an import, there must be a parent module.
+            assert matching_path is not None, f"The module named {module_name} was not provided to the stub generator."
 
-        # Import the regular definition name, alongside its builder.
-        self._add_import(
-            f"from {python_import_path} import "
-            f"{definition_name}, {helper.new_builder(definition_name)}, {helper.new_reader(definition_name)}"
-        )
+            # Find the relative path to go from the parent module, to this imported module.
+            common_path = os.path.commonpath([self._module_path, matching_path])
+
+            relative_module_path = self._module_path.relative_to(common_path)
+            relative_import_path = matching_path.relative_to(common_path)
+
+            # Shape the relative path to a relative Python import statement.
+            python_import_path = "." * len(relative_module_path.parents) + helper.replace_capnp_suffix(
+                ".".join(relative_import_path.parts)
+            )
+
+            # Import the regular definition name, alongside its builder.
+            self._add_import(
+                f"from {python_import_path} import "
+                f"{definition_name}, {helper.new_builder(definition_name)}, {helper.new_reader(definition_name)}"
+            )
 
         return self.register_type(schema.node.id, schema, name=definition_name, scope=self.scope.root)
 
@@ -744,13 +941,13 @@ class Writer:
         return full_name
 
     def register_type(
-        self, type_id: int, schema: capnp.lib.capnp._StructSchema, name: str = "", scope: Scope | None = None
+        self, type_id: int, schema: libcapnp._StructSchema, name: str = "", scope: Scope | None = None
     ) -> CapnpType:
         """Register a new type in the writer's registry of types.
 
         Args:
             type_id (int): The identification number of the type.
-            schema (capnp.lib.capnp._StructSchema): The schema that defines the type.
+            schema (libcapnp._StructSchema): The schema that defines the type.
             name (str, optional): An name to specify, if overriding the type name. Defaults to "".
             scope (Scope | None, optional): The scope in which the type is defined. Defaults to None.
 
@@ -798,13 +995,12 @@ class Writer:
         else:
             raise KeyError(f"The type ID '{type_id} was not found in the type registry.'")
 
-    def new_scope(self, name: str, node: Any, scope_heading: str = "", register: bool = True) -> Scope:
+    def new_scope(self, name: str, node: Any, register: bool = True, type: str|None = None) -> Scope:
         """Creates a new scope below the scope of the provided node.
 
         Args:
             name (str): The name of the new scope.
             node (Any): The node whose scope is the parent scope of the new scope.
-            scope_heading (str): The line of code that starts this new scope.
             register (bool): Whether to register this scope.
 
         Returns:
@@ -816,12 +1012,10 @@ class Writer:
         except KeyError as e:
             raise NoParentError(f"The scope with name '{name}' has no parent.") from e
 
-        # Add the heading of the scope to the parent scope.
-        if scope_heading:
-            parent_scope.add(scope_heading)
-
         # Then, make a new scope that is one indent level deeper.
         child_scope = Scope(name=name, id=node.id, parent=parent_scope, return_scope=self.scope)
+        if type:
+            child_scope.type = type
 
         self.scope = child_scope
 
@@ -883,6 +1077,28 @@ class Writer:
             if generic_params:
                 type_name += f"[{', '.join(generic_params)}]"
 
+        elif type_reader_type == capnp_types.CapnpElementType.INTERFACE:
+            element_type = self.get_type_by_id(type_reader.interface.typeId)
+            type_name = element_type.name
+            generic_params = []
+
+            for brand_scope in type_reader.interface.brand.scopes:
+                brand_scope_type = brand_scope.which()
+
+                if brand_scope_type == "inherit":
+                    parent_scope = self.get_type_by_id(brand_scope.scopeId)
+                    generic_params.extend(parent_scope.generic_params)
+
+                elif brand_scope_type == "bind":
+                    for bind in brand_scope.bind:
+                        generic_params.append(self.get_type_name(bind.type))
+
+                else:
+                    raise TypeError(f"Unknown brand scope '{brand_scope_type}'.")
+
+            if generic_params:
+                type_name += f"[{', '.join(generic_params)}]"
+
         elif type_reader_type == capnp_types.CapnpElementType.ENUM:
             element_type = self.get_type_by_id(type_reader.enum.typeId)
             type_name = element_type.name
@@ -922,6 +1138,15 @@ class Writer:
             out.append("")
 
         out.extend(self.scope.lines)
+
+
+        anonymous_scope = self.scopes_by_id.get(0, None)
+        if anonymous_scope:
+            out.extend("")
+            out.extend("")
+            out.extend("")
+            out.extend(anonymous_scope.lines)
+
         return "\n".join(out)
 
     def dumps_py(self) -> str:
@@ -937,16 +1162,24 @@ class Writer:
         out.append("import os")
         out.append("import site")
         out.append("import capnp # type: ignore")
-        out.append("capnp.remove_import_hook()")
+        # out.append("capnp.remove_import_hook()")
         out.append("here = os.path.dirname(os.path.abspath(__file__))")
 
         out.append(f'module_file = os.path.abspath(os.path.join(here, "{self.display_name}"))')
-        out.append("module = capnp.load(module_file, imports=site.getsitepackages())  # pylint: disable=no-member")
+        out.append("module = capnp.SchemaParser().load(module_file, imports=site.getsitepackages())  "
+                   "# pylint: disable=no-member")
+
+        out.append("")
+        out.append("for attr in dir(module):")
+        out.append("    if not attr.startswith('__'):")
+        out.append("        globals()[attr] = getattr(module, attr)")
+        out.append("")
 
         for scope in self.scopes_by_id.values():
-            if scope.parent is not None and scope.parent.is_root:
+            if scope.parent is not None and scope.parent.is_root and scope.parent.id > 0:
                 out.append(f"{scope.name} = module.{scope.name}")
                 if scope.type == "struct":
+                    # Add Reader/Builder aliases
                     out.append(f"{helper.new_builder(scope.name)} = {scope.name}")
                     out.append(f"{helper.new_reader(scope.name)} = {scope.name}")
 
