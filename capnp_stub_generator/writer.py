@@ -558,6 +558,9 @@ class Writer:
 
             self.scope.add(helper.new_function("which", parameters=["self"], return_type=return_type))
 
+        if slot_fields:
+            self.scope.add(helper.new_function("__init__", parameters=["self"] + slot_fields))
+
         # Add an overloaded `init` function for each nested struct.
         if init_choices:
             self._add_typing_import("Literal")
